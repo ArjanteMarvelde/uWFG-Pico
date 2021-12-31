@@ -1,0 +1,31 @@
+.program wfgout
+
+; PIO assembly code
+; Just output next 8 bits from OSR to the pins
+
+.wrap_target
+	out pins, 8
+.wrap
+
+
+; This function is inserted in the C environment
+%c-sdk {
+static inline void wfgout_program_init(PIO pio, uint sm, uint offset, uint pinbase, uint pincount, float divide) 
+{
+	pio_sm_config config;
+	uint i;	
+	
+	for (i=0; i<pincount; i++)
+		pio_gpio_init(pio, (pinbase+i));									// Initialize pins for PIO, required when output
+	pio_sm_set_consecutive_pindirs(pio, sm, pinbase, pincount, true);		// Set as output
+	
+	config = wfgout_program_get_default_config(offset);						// Define the config object for program allocated at offset
+	sm_config_set_out_pins(&config, pinbase, pincount);						// Set and initialize the output pins
+	sm_config_set_clkdiv(&config, divide);									// Set run speed SysCLK/divide
+	sm_config_set_out_shift(&config, true, true, 32);						// OSR (c, rightshift, autopull, #bits before pull)
+	sm_config_set_fifo_join(&config, PIO_FIFO_JOIN_TX);						// Join unused RX fifo to obtain double depth
+	
+	pio_sm_init(pio, sm, offset, &config);									// Apply config
+	pio_sm_set_enabled(pio, sm, true);										// Activate the state machine
+}
+%}
