@@ -5,7 +5,7 @@ Inspired by a description of an [Arbitrary Waveform Generator](https://www.instr
 
 The prototype provides two channels with 8 bit resolution, on which waveforms (sample files) can be played independently. The maximum sample frequency is the system clock, so on a Pico this is by default 125MHz. This obviously sets a limit to the maximum waveform frequency, in the sense that it will be a tradeoff with desired accuracy. If a sample file defining a single wave has a length of 25 samples, the maximum frequency is 125/25 = 5MHz. 
 
-Still, the performance is quite remarkable, and mostly limited by the implementation of the R-2R ladder network on the digital output. Stray capacitance together with the used resistor values will act as a low-pass filter, in case of the prototype maxing out to about 10MHz. 
+Still, the performance is quite remarkable, and mostly limited by the implementation of the R-2R ladder network on the digital output. Stray capacitance together with the used resistor values and maybe some inductance will act as a low-pass filter, in case of the prototype maxing output to about 10MHz. 
 
 ![1MHz](doc/SQ-1MHz.jpg)  
 
