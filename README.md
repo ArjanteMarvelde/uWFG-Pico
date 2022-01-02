@@ -13,7 +13,7 @@ Above image shows 1MHz square waves on both output channels. It must be noted th
  
 ![Proto-schematic](doc/Proto-schematic.gif) 
  
- 
+The OpAmp used in this circuit must be a high-speed type, so it does not interfere too much with the waveform. I have used the AD811, which is really a video driver and it goes up to more than 100MHz. The non-inverting case is used here to maximize the input impedance. A slight disadvantage is that it needs to to be supplied with more than +/-5V, in order to fit the whole output range. 
  
  
 # Copyright notice
