@@ -11,7 +11,7 @@ Still, the performance is quite remarkable, and mostly limited by the implementa
 
 Above image shows 1MHz square waves on both output channels. It must be noted that the R value in the ladder networks is 0.5k in channel A and 1k in channel B, nicely showing the low-pass effect. 
 
+![Proto-schematic](doc/Proto-schematic.gif) 
 
-![Proto schematic](doc/Proto-schematic.gif) 
 
 
