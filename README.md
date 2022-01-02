@@ -14,3 +14,4 @@ Above image shows 1MHz square waves on both output channels. It must be noted th
 
 ![Proto schematic](doc/Proto-schematic.gif) 
 
+
