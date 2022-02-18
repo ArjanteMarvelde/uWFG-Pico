@@ -11,3 +11,6 @@
 
 
 #endif
+
+void hmi_init(void);
+void hmi_evaluate(void);

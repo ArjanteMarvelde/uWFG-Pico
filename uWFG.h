@@ -6,7 +6,7 @@
  * Created: Dec 2021
  * Author: Arjan te Marvelde
  *
- * See uWFG.c for more information 
+ * See uWFG.c and waveform.c for more information 
  */
 
 extern uint8_t sine16[16];

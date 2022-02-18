@@ -46,69 +46,63 @@
  *  CH1: 0x003f800f (IRQ_QUIET=0x1, TREQ_SEL=0x3f, CHAIN_TO=0, INCR_WRITE=0, INCR_READ=0, DATA_SIZE=2, HIGH_PRIORITY=1, EN=1)
  *  CH2: 0x0020981f (IRQ_QUIET=0x1, TREQ_SEL=0x01, CHAIN_TO=3, INCR_WRITE=0, INCR_READ=1, DATA_SIZE=2, HIGH_PRIORITY=1, EN=1)	
  *  CH3: 0x003f900f (IRQ_QUIET=0x1, TREQ_SEL=0x3f, CHAIN_TO=2, INCR_WRITE=0, INCR_READ=0, DATA_SIZE=2, HIGH_PRIORITY=1, EN=1)
-*/
+ */
 
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include "pico/stdlib.h"
 #include "pico/sem.h"
-#include "hardware/i2c.h"
 #include "hardware/gpio.h"
-#include "hardware/timer.h"
-#include "hardware/clocks.h"
-#include "hardware/irq.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
+#include "hardware/pll.h"
 
 #include "wfgout.pio.h"
 #include "gen.h"
 
-#define FSYS		1.25e8f
+float _fsys;																	// System clock frequency
 
 /*
- * Global variables that hold the active parameters for both channels
+ * DMA pipe definitions, assume channels 0, 1, 2 and 3 for A-DATA, A-CTRL, B-DATA and B-CTRL
  */
-uint		a_sm = 0, b_sm = 1;												// PIO0 state machine numbers
-uint32_t 	*a_buffer, *b_buffer;											// Buffer address
-uint32_t	a_buflen, b_buflen;												// Buffer length (in 32bit words)
-float		a_freq, b_freq;													// Buffer frequency
+#define DMA_DC(i)		(((i)==0) ? 0x0020081f : 0x0020981f)				// See derivation above
+#define DMA_CC(i)		(((i)==0) ? 0x003f800f : 0x003f900f)
 
 /*
- * DMA channel definitions
+ * Global variables that hold the active parameters for both output channels
  */
-#define DMA_ADATA		0
-#define DMA_ACTRL		1
-#define DMA_BDATA		2
-#define DMA_BCTRL		3
+#define PINA	0															// PIO channe A and B start pin numbers
+#define PINB	8
 
-#define DMA_ADATA_C		0x0020081f
-#define DMA_ACTRL_C		0x003f800f
-#define DMA_BDATA_C		0x0020981f
-#define DMA_BCTRL_C		0x003f900f
+#define GEN_MINBUFLEN		  20											// Minimum nr of samples (10msec - 160nsec)
+#define GEN_MAXBUFLEN		2000											// Maximum buffer size (1sec - 16usec)
+wfg_t	wfg_ctrl[2];														// Active 
 
-/* 
- * Define initial waveforms 
- */
-#define A_FREQ			1.0e6f
-#define A_BUFLEN			4
-uint32_t a_buf[A_BUFLEN] = {0x00000000, 0x00000000, 0xffffffff, 0xffffffff};
-#define B_FREQ			1.0e6f
-#define B_BUFLEN			4
-uint32_t b_buf[B_BUFLEN] = {0x00000000, 0x00000000, 0xffffffff, 0xffffffff};
+// Allocate maximum size samplebuffers for channel A and B 
+uint8_t a_buf[GEN_MAXBUFLEN] __attribute__((aligned(4)));					// DMA requires to align on 32 bit boundary
+uint8_t b_buf[GEN_MAXBUFLEN] __attribute__((aligned(4)));
+
+
 
 /*
- * Unit initialization, only call this once!
+ * Unit initialization, !only call this once!
  * This function initializes the WFG parameters, the PIO statemachines and teh DMA channels.
  */
-void wfg_init()
+void gen_init()
 {
-	float fsam;
 	float div;
-	uint i;
-	uint offset;
+	uint i, offset;
+	int ch;
 	
-	for (i=0; i<8; i++)														// Initialize the used pins
+	/* Retrieve system clock frequency */
+	_fsys = 1.2e7;															// Assume 12MHz XOSC
+	_fsys *= pll_sys_hw->fbdiv_int&0xfff;									// Feedback divider
+	_fsys /= (pll_sys_hw->prim&0x00070000)>>16;								// Primary divider 1
+	_fsys /= (pll_sys_hw->prim&0x00007000)>>12;								// Primary divider 2
+
+	/* Set GPIO pin behaviour */
+	for (i=0; i<8; i++)														// Initialize the channel A and B  pins
 	{
 		gpio_set_function(PINA+i, GPIO_FUNC_PIO0);							// Function: PIO
 		gpio_set_slew_rate(PINA+i, GPIO_SLEW_RATE_FAST);					// No slewrate limiting
@@ -118,94 +112,79 @@ void wfg_init()
 		gpio_set_drive_strength(PINB+i, GPIO_DRIVE_STRENGTH_8MA);
 	}
 	
-	a_buffer = &a_buf[0];													// Initialize active parameters
-	a_buflen = A_BUFLEN;
-	a_freq   = A_FREQ;
-	b_buffer = &b_buf[0];
-	b_buflen = B_BUFLEN;
-	b_freq   = B_FREQ;
+	/* Initialize the buffers and channel control structures */
+	for (i= 0; i<64; i++) {a_buf[i] = 0x00; a_buf[i+64] = 0xff;}			// Square wave
+	wfg_ctrl[0].buf = a_buf;												//  in A sample buffer
+	wfg_ctrl[0].len = 128; 													//  of 128 samples
+	wfg_ctrl[0].dur = 1.0e-6;												//  and 1 usec duration
+	for (i= 0; i<64; i++) {b_buf[i] = i*4; b_buf[i+64] = 0xff-(i*4);} 		// Triangle wave
+	wfg_ctrl[1].buf = b_buf;												//  in B sample buffer
+	wfg_ctrl[1].len = 128;													//  of 128 samples
+	wfg_ctrl[1].dur = 1.0e-6;												//  and 1usec duration
 
-	offset = pio_add_program(pio0, &wfgout_program);						// Move program to PIO space and obtain offset
+	/* Initialize PIO and channel A and B statemachines */
+	offset = pio_add_program(pio0, &wfgout_program);						// Move program to PIO space and obtain its offset
 
-	fsam = a_freq * 4.0 * (float)a_buflen;									// Required sample rate = samples in buffer * freq
-	div = FSYS / fsam;														// Ratio FSYS and sampleclock
-	if (div < 1.0) div=1.0; 												// Cannot get higher than FSYS
-	wfgout_program_init(pio0, a_sm, offset, (uint)PINA, (uint)8, div);		// Invoke PIO initializer (see wfgout.pio.h)
-	
-	fsam = b_freq * 4.0 * (float)b_buflen;									// Required sample rate = samples in buffer * freq
-	div = FSYS / fsam;														// Ratio FSYS and sampleclock
-	if (div < 1.0) div=1.0; 												// Cannot get higher than FSYS
-	wfgout_program_init(pio0, b_sm, offset, (uint)PINB, (uint)8, div);		// Invoke PIO initializer (see wfgout.pio.h)
+	for (ch=0; ch<2; ch++)
+	{
+		div = _fsys * wfg_ctrl[ch].dur / wfg_ctrl[ch].len;						// Ratio of fsys and channel B sampleclock
+		if (div < 1.0) div=1.0; 												// Cannot get higher than FSYS
+		wfgout_program_init(pio0, ch, offset, (uint)(ch*PINB), (uint)8, div);	// Invoke PIO initializer for channel B 
 
-	dma_hw->ch[DMA_ADATA].read_addr = (io_rw_32)a_buffer;					// Read from waveform buffer
-	dma_hw->ch[DMA_ADATA].write_addr = (io_rw_32)&pio0->txf[a_sm];			// Write to PIO TX fifo
-	dma_hw->ch[DMA_ADATA].transfer_count = a_buflen;						// Nr of 32 bit words to transfer
-	dma_hw->ch[DMA_ADATA].al1_ctrl = DMA_ADATA_C;							// Write ctrl word without starting the DMA
-
-	dma_hw->ch[DMA_ACTRL].read_addr = (io_rw_32)&a_buffer;					// Read from waveform buffer address reference
-	dma_hw->ch[DMA_ACTRL].write_addr = (io_rw_32)&dma_hw->ch[DMA_ADATA].read_addr;	// Write to data channel read address
-	dma_hw->ch[DMA_ACTRL].transfer_count = 1;								// One word to transfer
-	dma_hw->ch[DMA_ACTRL].ctrl_trig = DMA_ACTRL_C;							// Write ctrl word and start DMA
-	
-	dma_hw->ch[DMA_BDATA].read_addr = (io_rw_32)b_buffer;					// Read from waveform buffer
-	dma_hw->ch[DMA_BDATA].write_addr = (io_rw_32)&pio0->txf[b_sm];			// Write to PIO TX fifo
-	dma_hw->ch[DMA_BDATA].transfer_count = b_buflen;						// Nr of 32 bit words to transfer
-	dma_hw->ch[DMA_BDATA].al1_ctrl = DMA_BDATA_C;							// Write ctrl word without starting the DMA
-
-	dma_hw->ch[DMA_BCTRL].read_addr = (io_rw_32)&b_buffer;					// Read from waveform buffer address reference
-	dma_hw->ch[DMA_BCTRL].write_addr = (io_rw_32)&dma_hw->ch[DMA_BDATA].read_addr;	// Write to data channel read address
-	dma_hw->ch[DMA_BCTRL].transfer_count = 1;								// One word to transfer
-	dma_hw->ch[DMA_BCTRL].ctrl_trig = DMA_BCTRL_C;							// Write ctrl word and start DMA
+		dma_hw->ch[2*ch].read_addr = (io_rw_32)wfg_ctrl[ch].buf;				// Read from waveform buffer
+		dma_hw->ch[2*ch].write_addr = (io_rw_32)&pio0->txf[ch];					// Write to PIO TX fifo
+		dma_hw->ch[2*ch].transfer_count = wfg_ctrl[ch].len/4;					// Nr of 32 bit words to transfer
+		dma_hw->ch[2*ch].al1_ctrl = DMA_DC(ch);									// Write ctrl word without starting the DMA
+		dma_hw->ch[2*ch+1].read_addr = (io_rw_32)&(wfg_ctrl[ch].buf);			// Read from waveform buffer address reference
+		dma_hw->ch[2*ch+1].write_addr = (io_rw_32)&dma_hw->ch[2*ch].read_addr;	// Write to data channel read address
+		dma_hw->ch[2*ch+1].transfer_count = 1;									// One word to transfer
+		dma_hw->ch[2*ch+1].ctrl_trig = DMA_CC(ch);								// Write ctrl word and start DMA
+	}
 }
 
 /*
- * This function is the main API of the generator.
+ * This function is the main API of the generator on channel ch.
  * Parameters are a waveform samples buffer, its length and a desired frequency.
- * It is assumed that the buffer contains one wave, and the frequency will be maximized at Fsys/buflen
+ * It is assumed that the buffer contains one wave, and the frequency will be maximized at fsys/buflen
  */
-void wfg_play(int output, wfg_t *wave)
+void gen_play(int ch, wfg_t *wave)
 {
 	uint32_t clkdiv;														// 31:16 int part, 15:8 frac part (in 1/256)
+	uint32_t len;
 	float div;
+
+	ch &= 1;																// Truncate channel into range
+	len = (uint32_t)wave->len; len &= ~3;									// Force multiple of 4
+	if (len<GEN_MINBUFLEN) return;											// Insufficient samples
+	if (len>GEN_MAXBUFLEN) len = GEN_MAXBUFLEN;								// Truncate to maximum
 	
-	div = FSYS/((wave->freq)*(wave->len)*4.0);								// Calculate divider
-	if (div < 1.0) div=1.0; 
+	/* Calculate PIO clock divider */
+	div = _fsys * wave->dur / len;											// Sample rate to fsys ratio
+	if (div < 1.0) div=1.0; 												// Sample rate too high: top off
 	clkdiv = (uint32_t)div;													// Extract integer part
 	div = (div - clkdiv)*256;												// Fraction x 256
 	clkdiv = (clkdiv << 8) + (uint32_t)div;									// Add 8bit integer part of fraction
 	clkdiv = clkdiv << 8;													// Final shift to match required format
 
-	if (output)
-	{
-		b_buffer = wave->buf;
-		b_buflen = wave->len;
-		b_freq   = wave->freq;
-		dma_hw->ch[DMA_BDATA].read_addr = (io_rw_32)b_buffer;				// Read from waveform buffer
-		dma_hw->ch[DMA_BDATA].write_addr = (io_rw_32)&pio0->txf[b_sm];		// Write to PIO TX fifo
-		dma_hw->ch[DMA_BDATA].transfer_count = b_buflen;					// Nr of 32 bit words to transfer
-		dma_hw->ch[DMA_BDATA].al1_ctrl = DMA_BDATA_C;						// Write ctrl word without starting the DMA
-		dma_hw->ch[DMA_BCTRL].read_addr = (io_rw_32)&b_buffer;				// Read from waveform buffer address reference
-		dma_hw->ch[DMA_BCTRL].write_addr = (io_rw_32)&dma_hw->ch[DMA_BDATA].read_addr;	// Write to data channel read address
-		dma_hw->ch[DMA_BCTRL].transfer_count = 1;							// One word to transfer
-		dma_hw->ch[DMA_BCTRL].ctrl_trig = DMA_BCTRL_C;						// Write ctrl word and start DMA
-		pio0_hw->sm[b_sm].clkdiv = (io_rw_32)clkdiv;						// Set new value
-		pio_sm_clkdiv_restart(pio0, b_sm);									// Restart clock
-	}
-	else
-	{
-		a_buffer = wave->buf;
-		a_buflen = wave->len;
-		a_freq   = wave->freq;
-		dma_hw->ch[DMA_ADATA].read_addr = (io_rw_32)a_buffer;				// Read from waveform buffer
-		dma_hw->ch[DMA_ADATA].write_addr = (io_rw_32)&pio0->txf[a_sm];		// Write to PIO TX fifo
-		dma_hw->ch[DMA_ADATA].transfer_count = a_buflen;					// Nr of 32 bit words to transfer
-		dma_hw->ch[DMA_ADATA].al1_ctrl = DMA_ADATA_C;						// Write ctrl word without starting the DMA
-		dma_hw->ch[DMA_ACTRL].read_addr = (io_rw_32)&a_buffer;				// Read from waveform buffer address reference
-		dma_hw->ch[DMA_ACTRL].write_addr = (io_rw_32)&dma_hw->ch[DMA_ADATA].read_addr;	// Write to data channel read address
-		dma_hw->ch[DMA_ACTRL].transfer_count = 1;							// One word to transfer
-		dma_hw->ch[DMA_ACTRL].ctrl_trig = DMA_ACTRL_C;						// Write ctrl word and start DMA
-		pio0_hw->sm[a_sm].clkdiv = (io_rw_32)clkdiv;						// Set new value
-		pio_sm_clkdiv_restart(pio0, a_sm);									// Restart clock
-	}
+	/* Store waveform */
+	dma_channel_abort(2*ch);												// Stop DMA transfers, to prevent collisions
+	dma_channel_abort(2*ch+1);
+	memcpy(wfg_ctrl[ch].buf, wave->buf, len);								// Copy samples from input
+	wfg_ctrl[ch].len = len;
+	wfg_ctrl[ch].dur = wave->dur;
+
+	/* Re-program PIO */
+	pio0_hw->sm[ch].clkdiv = (io_rw_32)clkdiv;								// Set new value
+	pio_sm_clkdiv_restart(pio0, ch);										// Restart clock
+	
+	/* Re-program DMA */
+	dma_hw->ch[2*ch].read_addr = (io_rw_32)wfg_ctrl[ch].buf;				// Read from waveform buffer
+	dma_hw->ch[2*ch].write_addr = (io_rw_32)&pio0->txf[ch];					// Write to PIO TX fifo
+	dma_hw->ch[2*ch].transfer_count = wfg_ctrl[ch].len/4;					// Nr of 32 bit words to transfer
+	dma_hw->ch[2*ch].al1_ctrl = DMA_DC(ch);									// Write ctrl word without starting the DMA
+	dma_hw->ch[2*ch+1].read_addr = (io_rw_32)&(wfg_ctrl[ch].buf);			// Read from waveform buffer address reference
+	dma_hw->ch[2*ch+1].write_addr = (io_rw_32)&dma_hw->ch[2*ch].read_addr;	// Write to data channel read address
+	dma_hw->ch[2*ch+1].transfer_count = 1;									// One word to transfer
+	dma_hw->ch[2*ch+1].ctrl_trig = DMA_CC(ch);								// Write ctrl word and start DMA
 }
 

@@ -1,4 +1,7 @@
-# Generated Cmake Pico project file
+# Cmake Pico project file
+
+# After changing this file, empty build folder and execute from there:  
+#     cmake -G "NMake Makefiles" ..
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -19,7 +22,7 @@ project(uWFG C CXX ASM)
 pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
-add_executable(uWFG uWFG.c gen.c monitor.c)
+add_executable(uWFG uWFG.c gen.c waveform.c monitor.c lcd.c hmi.c lcdfont.c lcdlogo.c)
 
 pico_set_program_name(uWFG "uWFG")
 pico_set_program_version(uWFG "0.1")
